@@ -1,179 +1,310 @@
+
+# best
 import streamlit as st
-from PyPDF2 import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-import google.generativeai as genai
-from langchain.vectorstores import FAISS
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
-from langchain.docstore.document import Document
-from dotenv import load_dotenv
+import cohere
+import fitz  
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail, Attachment, FileContent, FileName, FileType, Disposition
 import os
+from io import BytesIO
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from dotenv import load_dotenv
+import requests
+import datetime
+import base64
 
-# Load environment variables
 load_dotenv()
-api_key = os.getenv("GOOGLE_API_KEY")
 
-# Check if API key is available
-if not api_key:
-    st.error("API Key not found. Please set your GOOGLE_API_KEY in the environment variables.")
-    st.stop()  # Stop execution if API key is missing
+# Initialize Cohere API
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+co = cohere.Client(COHERE_API_KEY)
 
-genai.configure(api_key=api_key)
 
-# Function to extract text from uploaded PDFs
-def get_pdf_text(pdf_docs):
-    text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
+st.set_page_config(page_title="Legal Document Analyzer", layout="wide")
+
+# Sidebar - File Uploader
+st.sidebar.title("📂 Upload Legal Document")
+uploaded_file = st.sidebar.file_uploader("Choose a PDF file", type=["pdf"])
+
+# Email Sending Function
+def send_email(recipient_email, pdf_buffer):
+    sendgrid_api_key = os.getenv("SENDGRID_API_KEY")
+    sender_email = os.getenv("SENDER_EMAIL")
+    pdf_buffer.seek(0)
+    pdf_data = pdf_buffer.read()
+    encoded_pdf = base64.b64encode(pdf_data).decode()
+    
+    message = Mail(
+        from_email=sender_email,
+        to_emails=recipient_email,
+        subject="📄 Legal Document Report",
+        html_content="Please find the attached legal document report."
+    )
+    
+    attachment = Attachment(
+        FileContent(encoded_pdf),
+        FileName("Legal_Report.pdf"),
+        FileType("application/pdf"),
+        Disposition("attachment")
+    )
+    message.attachment = attachment
+    
+    try:
+        sg = SendGridAPIClient(sendgrid_api_key)
+        sg.send(message)
+        return True
+    except Exception as e:
+        st.error(f"⚠ Email sending failed: {e}")
+        return False
+    
+# Extract Text from PDF
+def extract_text_from_pdf(pdf_file):
+    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    text = "\n".join(page.get_text("text") for page in doc)
     return text
 
-# Function to split text into manageable chunks
-def get_text_chunks(text):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=10000, chunk_overlap=1000)
-    return text_splitter.split_text(text)
+# Summarization Function
+def summarize_document(text):
+    chunks = text[:4000]
+    prompt = f"Summarize the following legal document:\n\n{chunks}"
+    response = co.generate(prompt=prompt, model="command", max_tokens=300)
+    return response.generations[0].text.strip()
 
-# Function to create and save a vector store from text chunks
-def get_vector_store(text_chunks):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-    vector_store.save_local("faiss_index")
+# Risk Identification Function
+def identify_risks(text):
+    chunks = text[:4000]
+    prompt = f"Identify potential legal risks in the following document:\n\n{chunks}"
+    response = co.generate(prompt=prompt, model="command", max_tokens=300)
+    return response.generations[0].text.strip()
 
-# Function to create a conversational chain with a custom prompt
-def get_conversational_chain():
-    prompt_template = """
-    Answer the question as detailed as possible from the provided context. If the answer is not in the provided context,
-    just say, "Answer is not available in the context," and do not provide a wrong answer.
-    Context: {context}
-    Question: {question}
-    Answer:
-    """
-    model = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.3)
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    return load_qa_chain(model, chain_type="stuff", prompt=prompt)
 
-# Function to summarize text using the language model
-def summarize_text(text):
-    summarizer = ChatGoogleGenerativeAI(model="gemini-1.5-pro", temperature=0.7)  # Adjusted temperature for more variety
-    summary_prompt = """
-    Provide a detailed and comprehensive summary of the following text. Make sure to include all important points and key details:
-    Text: {context}
-    Detailed Summary:
-    """
-    prompt = PromptTemplate(template=summary_prompt, input_variables=["context"])
+import matplotlib.pyplot as plt
+
+import PyPDF2
+
+
+def extract_text_from_pdf(pdf_file):
+    pdf_reader = PyPDF2.PdfReader(pdf_file)
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text() + "\n"
+    return text.strip()
+
+# Function to chunk text into smaller parts
+def chunk_text(text, max_tokens=4000):
+    return [text[i:i + max_tokens] for i in range(0, len(text), max_tokens)]
+
+# Function to identify risks in the document
+def identify_risks(text):
+    chunks = chunk_text(text)
+    risk_counts = {"Low": 0, "Medium": 0, "High": 0}
+    all_risks = [] 
+
+    for chunk in chunks:
+        prompt = f"""
+        Identify all potential risks in the following document and categorize them into Low, Medium, or High risk:
+        \n\n{chunk}
+        \n\nReturn the risks in this format: Risk Name - Risk Level (Low/Medium/High)
+        """
+        response = co.generate(prompt=prompt, model="command", max_tokens=500)
+
+        risks = response.generations[0].text.strip().split("\n")
+        all_risks.extend(risks)
+
+        for risk in risks:
+            if "High" in risk:
+                risk_counts["High"] += 1
+            elif "Medium" in risk:
+                risk_counts["Medium"] += 1
+            elif "Low" in risk:
+                risk_counts["Low"] += 1
+
+    return all_risks, risk_counts
+
+# Function to plot risk distribution graph
+def plot_risk_chart(risk_data):
+    labels = risk_data.keys()
+    values = risk_data.values()
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.bar(labels, values, color=['green', 'orange', 'red'])
+    ax.set_xlabel("Risk Level")
+    ax.set_ylabel("Number of Risks")
+    ax.set_title("Risk Distribution in Document")
+    st.pyplot(fig)
+
+# Answering Function
+def answer_question(text, question):
+    chunks = text[:4000]
+    prompt = f"Given the following legal document:\n\n{chunks}\n\nAnswer the question:\n{question}"
+    response = co.chat(message=prompt, model="command-r")
+    return response.text.strip()
+
+import requests
+from bs4 import BeautifulSoup
+import streamlit as st
+
+def fetch_gdpr_rules():
+    """Scrape GDPR compliance rules from gdpr.eu website."""
+    try:
+        url = "https://gdpr.eu/compliance-checklist/"
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if response.status_code != 200:
+            return []
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        rules = [item.get_text(strip=True) for item in soup.find_all("li") if len(item.get_text(strip=True)) > 10]
+        return rules
+
+    except requests.RequestException:
+        return []
+
+def check_gdpr_compliance(file_content):
+    """Check if uploaded file violates GDPR rules and return YES/NO."""
+    gdpr_rules = fetch_gdpr_rules()
+    if not gdpr_rules:
+        return "Error fetching GDPR rules."
+
+    for rule in gdpr_rules:
+        if rule.lower() in file_content.lower():
+            return "YES"  # Violates GDPR
+
+    return "NO"  # Does not violate GDPR
+
+
+# PDF Report Generation
+def generate_pdf(summary, risks, chat_history):
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
     
-    chain = load_qa_chain(summarizer, chain_type="stuff", prompt=prompt)
-    
-    # Wrap the text in a Document object with page_content
-    input_data = {"input_documents": [Document(page_content=text)]}
-    
-    summary = chain(input_data, return_only_outputs=True)
-    return summary["output_text"]
+    elements = []
+    elements.append(Paragraph("📄 Legal Document Analysis Report", styles["Title"]))
+    elements.append(Spacer(1, 12))
 
-# Function to process user input and return a response
-def process_user_input(user_question):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    vector_store = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-    docs = vector_store.similarity_search(user_question)
-    
-    chain = get_conversational_chain()
-    response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
-    
-    return response["output_text"]
+    elements.append(Paragraph("📄 Summary", styles["Heading2"]))
+    elements.append(Paragraph(summary.replace("\n", "<br/>"), styles["Normal"]))
+    elements.append(Spacer(1, 12))
 
-# Main Streamlit app function
-def main():
-    st.set_page_config(page_title="Chat with PDF")
-    st.header("Chat with PDF using Gemini💁")
+    elements.append(Paragraph("⚠ Risks Identified", styles["Heading2"]))
+    elements.append(Paragraph("\n".join(risks).replace("\n", "<br/>"), styles["Normal"]))
 
-    with st.sidebar:
-        st.title("Menu:")
-        pdf_docs = st.file_uploader("Upload your PDF Files and Click on the Submit & Process Button", accept_multiple_files=True)
-        
-        if st.button("Submit & Process", key="process_button"):
-            if pdf_docs:
-                with st.spinner("Processing..."):
-                    raw_text = get_pdf_text(pdf_docs)
-                    text_chunks = get_text_chunks(raw_text)
-                    get_vector_store(text_chunks)
-                    st.success("Processing complete! Ask your questions below.")
+    elements.append(Spacer(1, 12))
+
+    if chat_history:
+        elements.append(Paragraph("💬 Chat History", styles["Heading2"]))
+        for chat in chat_history:
+            question, answer = chat
+            elements.append(Paragraph(f"<b>You:</b> {question}", styles["Normal"]))
+            elements.append(Paragraph(f"<b>AI:</b> {answer}", styles["Normal"]))
+            elements.append(Spacer(1, 6))
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
+
+# UI - Tabs Section
+if uploaded_file:
+    document_text = extract_text_from_pdf(uploaded_file)
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📂 PDF Analysis", "⚠️ Risk Detection", "🤖 Chatbot", "📄 Report & Email", "📜 GDPR Compliance Checklist"])
+
+    with tab1:
+        st.subheader("📄 Summary")
+        if "summary" not in st.session_state:
+            st.session_state.summary = summarize_document(document_text)
+        st.info(st.session_state.summary)
+
+    with tab2:
+        st.subheader("⚠ Risk Analysis")
+
+        if "risks" not in st.session_state:
+            st.session_state.risks = None
+            st.session_state.risk_data = None
+
+        if uploaded_file:
+            document_text = extract_text_from_pdf(uploaded_file)
+            st.success("✅ PDF uploaded and text extracted!")
+
+            if st.button("Analyze Risks"):
+                with st.spinner("Identifying risks..."):
+                    risks, risk_data = identify_risks(document_text)
+                    st.session_state.risks = risks  # Store results in session state
+                    st.session_state.risk_data = risk_data
+
+        # Show identified risks if available
+        if st.session_state.risks:
+            st.subheader("Identified Risks")
+            for risk in st.session_state.risks:
+                st.warning(risk)
+
+        # Show risk graph if data available
+        if st.session_state.risk_data:
+            st.subheader("📊 Risk Distribution Graph")
+            plot_risk_chart(st.session_state.risk_data)
+
+
+    with tab3:
+        st.subheader("💬 AI Chatbot")
+        user_question = st.text_input("Ask a question about the document:")
+
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
+
+        if st.button("Get Answer"):
+            if user_question.strip() == "":
+                st.warning("⚠ Please enter a valid question!")
             else:
-                st.warning("Please upload at least one PDF file.")
-    
-    if 'pdf_texts' not in st.session_state:
-        st.session_state['pdf_texts'] = {}
+                with st.spinner("Analyzing... 🔍"):
+                    answer = answer_question(document_text, user_question)
+                    st.session_state.chat_history.append((user_question, answer))
 
-    if 'summary' not in st.session_state:
-        st.session_state['summary'] = ""
+        # Display full chat history
+        for chat in st.session_state.chat_history:
+            question, answer = chat
+            st.markdown(f"""
+            <div style="text-align: left; background-color: #f0f0f5; padding: 10px; border-radius: 10px; margin-bottom: 5px; width: 70%;">
+                <b>You:</b> {question}
+            </div>
+            <div style="text-align: right; background-color: #d1e7dd; padding: 10px; border-radius: 10px; margin-bottom: 5px; width: 70%; margin-left: 30%;">
+                <b>AI:</b> {answer}
+            </div>
+            """, unsafe_allow_html=True)
 
-    pdf_names = [pdf.name for pdf in pdf_docs] if pdf_docs else []
-    
-    # Summarization input
-    pdfs_to_summarize = st.text_input("Enter the names of the PDFs you want to summarize, separated by commas")
-    
-    if st.button("Summarize"):
-        if pdf_docs:
-        # Process user input for PDF names
-            pdf_names_input = [name.strip() for name in pdfs_to_summarize.split(",")]
+    with tab4:
+        st.subheader("📥 Download & Email Report")
 
-        # Initialize a variable to store combined text
-            text = ""
+        save_chat = st.checkbox("Include Chat History in PDF", value=True)
 
-        # Loop through all selected PDF names
-            for pdf_name, pdf_file in zip(pdf_names, pdf_docs):
-                if pdf_name in pdf_names_input:
-                # Only process the PDF if it's not already summarized
-                    if pdf_name not in st.session_state['pdf_texts']:
-                        st.session_state['pdf_texts'][pdf_name] = get_pdf_text([pdf_file])  # Store the PDF text in session
+        if st.button("Generate & Download Report"):
+            chat_history_to_save = st.session_state.chat_history if save_chat else []
+            pdf_buffer = generate_pdf(st.session_state.summary, st.session_state.risks, chat_history_to_save)
+            st.download_button("📥 Download Report", pdf_buffer, "Legal_Report.pdf", "application/pdf")
 
-                # Combine the text from the selected PDFs
-                    text += st.session_state['pdf_texts'][pdf_name]
-        
-        # Generate and store summaries for selected PDFs
-            for pdf_name in pdf_names_input:
-                if pdf_name in st.session_state['pdf_texts']:
-                # If the summary for this PDF has not been created yet
-                    if pdf_name not in st.session_state:
-                        summary = summarize_text(st.session_state['pdf_texts'][pdf_name])  # Create summary
-                        st.session_state[pdf_name] = summary  # Store the summary in session state
-                        st.write(f"Summary for {pdf_name}:", summary)  # Display the summary for this PDF
-                else:
-                    st.error(f"Error: PDF '{pdf_name}' not found.")
-                
-        else:
-            st.warning("Please upload PDF files before summarizing.")
-
-        
-            # Generate summary only if there's combined text
-            if text:
-                # If summary already exists for this PDF, skip summarization
-                if pdf_names_input[0] not in st.session_state:
-                    # Save the summary for the current PDF
-                    st.session_state[pdf_names_input[0]] = summarize_text(text)  # Store summary by PDF name
-                    st.write("Summary:", st.session_state[pdf_names_input[0]])  # Display only this summary
-                else:
-                    # If summary is already in session, display it
-                    st.write("Summary:", st.session_state[pdf_names_input[0]])
-
+        recipient_email = st.text_input("📧 Enter recipient's email:")
+        if st.button("Send Report via Email"):
+            if recipient_email.strip() == "":
+                st.warning("⚠ Please enter a valid email address!")
             else:
-                st.warning("Please upload PDF files before summarizing.")
+                chat_history_to_save = st.session_state.chat_history if save_chat else []
+                pdf_buffer = generate_pdf(st.session_state.summary, st.session_state.risks, chat_history_to_save)
+                if send_email(recipient_email, pdf_buffer):
+                    st.success("✅ Email sent successfully!")
+    
+    with tab5:
+        st.subheader("GDPR Compliance Checklist")
+        uploaded_file = st.file_uploader("Upload a document to check GDPR compliance", type=["txt", "pdf", "docx"])
+    
 
+        if uploaded_file:
+            file_content = uploaded_file.read().decode("utf-8", errors="ignore")
+            compliance_result = check_gdpr_compliance(file_content)
 
-
-
-    # Display the summary if it exists
-    if st.session_state['summary']:
-        st.write("Summary:", st.session_state['summary'])
-
-    # Question input
-    user_question = st.text_input("Ask a Question from the PDF Files")
-    if user_question:
-        with st.spinner("Generating response..."):
-            response = process_user_input(user_question)
-            st.write("Reply: ", response)
-
-if __name__ == "__main__":
-    main()
+            if compliance_result == "YES":
+                st.error("❌ Your document VIOLATES GDPR rules.")
+            elif compliance_result == "NO":
+                st.success("✅ Your document is GDPR COMPLIANT.")
+            else:
+                st.warning(compliance_result)
